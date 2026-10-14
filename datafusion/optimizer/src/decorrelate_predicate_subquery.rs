@@ -1107,9 +1107,10 @@ mod tests {
     use crate::assert_optimized_plan_eq_display_indent_snapshot;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_expr::builder::table_source;
+    use datafusion_expr::expr::WindowFunction;
     use datafusion_expr::{
-        TableScanBuilder, and, binary_expr, col, cube, grouping_set, out_ref_col, rollup,
-        table_scan,
+        ExprFunctionExt, TableScanBuilder, and, binary_expr, col, cube, grouping_set,
+        out_ref_col, rollup, table_scan,
     };
 
     macro_rules! assert_optimized_plan_equal {
@@ -3251,6 +3252,83 @@ mod tests {
                   Filter: sq.arr = outer_ref(outer_t.arr) [id:Int32;N, arr:List(Int32);N]
                     TableScan: sq [id:Int32;N, arr:List(Int32);N]
             TableScan: outer_t [id:Int32;N, arr:List(Int32);N]
+        "
+        )
+    }
+
+    /// Regression test for https://github.com/apache/datafusion/issues/26032:
+    /// In an IN predicate subquery with a duplicated correlated filter below an unpartitioned window,
+    /// the subquery must not be decorrelated because evaluating the window function across all rows
+    /// changes the per-group window result and produces incorrect output.
+    #[test]
+    fn in_subquery_window_with_duplicated_correlated_filter() -> Result<()> {
+        let unpartitioned_window = Expr::from(WindowFunction::new(
+            datafusion_functions_window::row_number::row_number_udwf(),
+            vec![],
+        ));
+
+        let subquery = Arc::new(
+            LogicalPlanBuilder::from(test_table_scan_with_name("sq")?)
+                .filter(col("sq.c").eq(out_ref_col(DataType::UInt32, "test.c")))?
+                .window(vec![unpartitioned_window])?
+                .project(vec![col("sq.c")])?
+                .build()?,
+        );
+
+        let plan = LogicalPlanBuilder::from(test_table_scan()?)
+            .filter(in_subquery(col("test.c"), subquery))?
+            .project(vec![col("test.c")])?
+            .build()?;
+
+        // Subquery must stay correlated because the window is unpartitioned
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.c [c:UInt32]
+          Filter: test.c IN (<subquery>) [a:UInt32, b:UInt32, c:UInt32]
+            Subquery: [c:UInt32]
+              Projection: sq.c [c:UInt32]
+                WindowAggr: windowExpr=[[row_number() ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]] [a:UInt32, b:UInt32, c:UInt32, row_number() ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING:UInt64]
+                  Filter: sq.c = outer_ref(test.c) [a:UInt32, b:UInt32, c:UInt32]
+                    TableScan: sq [a:UInt32, b:UInt32, c:UInt32]
+            TableScan: test [a:UInt32, b:UInt32, c:UInt32]
+        "
+        )
+    }
+
+    #[test]
+    fn in_subquery_window_with_duplicated_correlated_filter_partitioned() -> Result<()> {
+        let partitioned_window = Expr::from(WindowFunction::new(
+            datafusion_functions_window::row_number::row_number_udwf(),
+            vec![],
+        ))
+        .partition_by(vec![col("sq.c")])
+        .build()?;
+
+        let subquery = Arc::new(
+            LogicalPlanBuilder::from(test_table_scan_with_name("sq")?)
+                .filter(col("sq.c").eq(out_ref_col(DataType::UInt32, "test.c")))?
+                .window(vec![partitioned_window])?
+                .project(vec![col("sq.c")])?
+                .build()?,
+        );
+
+        let plan = LogicalPlanBuilder::from(test_table_scan()?)
+            .filter(in_subquery(col("test.c"), subquery))?
+            .project(vec![col("test.c")])?
+            .build()?;
+
+        // Subquery can be safely decorrelated because the window partitions by the correlated column
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.c [c:UInt32]
+          LeftSemi Join:  Filter: test.c = __correlated_sq_1.c [a:UInt32, b:UInt32, c:UInt32]
+            TableScan: test [a:UInt32, b:UInt32, c:UInt32]
+            SubqueryAlias: __correlated_sq_1 [c:UInt32]
+              Projection: sq.c [c:UInt32]
+                WindowAggr: windowExpr=[[row_number() PARTITION BY [sq.c] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]] [a:UInt32, b:UInt32, c:UInt32, row_number() PARTITION BY [sq.c] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING:UInt64]
+                  TableScan: sq [a:UInt32, b:UInt32, c:UInt32]
         "
         )
     }

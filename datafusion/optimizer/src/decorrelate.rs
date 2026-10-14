@@ -50,6 +50,9 @@ pub struct PullUpCorrelatedExpr {
     pub join_filters: Vec<Expr>,
     /// mapping from the plan to its holding correlated columns
     pub correlated_subquery_cols_map: HashMap<LogicalPlan, BTreeSet<Column>>,
+    /// mapping from the plan to all correlated columns from filters below it,
+    /// including filters removed because of in_predicate. Used for Window plan validation.
+    pub correlated_filter_cols_map: HashMap<LogicalPlan, BTreeSet<Column>>,
     pub in_predicate_opt: Option<Expr>,
     /// Is this an Exists(Not Exists) SubQuery. Defaults to **FALSE**
     pub exists_sub_query: bool,
@@ -104,6 +107,7 @@ impl PullUpCorrelatedExpr {
         Self {
             join_filters: vec![],
             correlated_subquery_cols_map: HashMap::new(),
+            correlated_filter_cols_map: HashMap::new(),
             in_predicate_opt: None,
             exists_sub_query: false,
             can_pull_up: true,
@@ -321,6 +325,8 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                 }
                 let (mut join_filters, subquery_filters) =
                     find_join_exprs(subquery_filter_exprs)?;
+                let all_correlated_subquery_cols =
+                    collect_subquery_cols(&join_filters, subquery_schema)?;
                 if let Some(in_predicate) = &self.in_predicate_opt {
                     // in_predicate may be already included in the join filters, remove it from the join filters first.
                     join_filters = remove_duplicated_filter(join_filters, in_predicate)?;
@@ -363,6 +369,8 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                                 .build()?;
                         self.correlated_subquery_cols_map
                             .insert(new_plan.clone(), correlated_subquery_cols);
+                        self.correlated_filter_cols_map
+                            .insert(new_plan.clone(), all_correlated_subquery_cols);
                         Ok(Transformed::yes(new_plan))
                     }
                     (None, _) => {
@@ -375,6 +383,8 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                         let new_plan = plan.build()?;
                         self.correlated_subquery_cols_map
                             .insert(new_plan.clone(), correlated_subquery_cols);
+                        self.correlated_filter_cols_map
+                            .insert(new_plan.clone(), all_correlated_subquery_cols);
                         Ok(Transformed::yes(new_plan))
                     }
                 }
@@ -527,6 +537,18 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                         .insert(Column::new(Some(alias.alias.clone()), col.name.clone()));
                 }
 
+                let mut local_filter_cols = BTreeSet::new();
+                collect_local_correlated_cols(
+                    &plan,
+                    &self.correlated_filter_cols_map,
+                    &mut local_filter_cols,
+                );
+                let mut new_filter_cols = BTreeSet::new();
+                for col in local_filter_cols.iter() {
+                    new_filter_cols
+                        .insert(Column::new(Some(alias.alias.clone()), col.name.clone()));
+                }
+
                 let new_plan = if alias.input.schema().fields().len()
                     != alias.schema.fields().len()
                 {
@@ -539,6 +561,8 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
 
                 self.correlated_subquery_cols_map
                     .insert(new_plan.clone(), new_correlated_cols);
+                self.correlated_filter_cols_map
+                    .insert(new_plan.clone(), new_filter_cols);
                 if let Some(input_map) = self.collected_count_expr_map.get(&*alias.input)
                 {
                     self.collected_count_expr_map
@@ -564,7 +588,7 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                 let mut local_correlated_cols = BTreeSet::new();
                 collect_local_correlated_cols(
                     &plan,
-                    &self.correlated_subquery_cols_map,
+                    &self.correlated_filter_cols_map,
                     &mut local_correlated_cols,
                 );
                 // A filter that reads only `PARTITION BY` columns keeps or drops
