@@ -97,7 +97,7 @@ use arrow::array::{
 };
 use arrow::compute::{BatchCoalescer, take};
 use arrow_ord::ord::make_comparator;
-use arrow_schema::{SchemaRef, SortOptions};
+use arrow_schema::{DataType, SchemaRef, SortOptions};
 use datafusion_common::{NullEquality, Result, internal_err};
 use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion_expr::{JoinType, Operator};
@@ -461,10 +461,12 @@ impl ExistencePWMJStream {
 /// Ordered the same way as [`JoinKeyComparator`]: both use IEEE 754 totalOrder for floats,
 /// and the comparator normalizes `-0.0` on either side of it.
 ///
-/// Nested keys use Arrow's comparator, so inner NULLs have the same ordering as
+/// Nested keys and RunEndEncoded keys use Arrow's comparator, so inner NULLs have the same ordering as
 /// sorting and range comparisons. Other keys use the typed min/max kernels.
 pub(super) fn extreme_key(values: &ArrayRef, descending: bool) -> Result<ArrayRef> {
-    if values.data_type().is_nested() {
+    if values.data_type().is_nested()
+        || matches!(values.data_type(), DataType::RunEndEncoded(_, _))
+    {
         // Reverse both value and inner-NULL ordering for max, matching SQL's
         // ascending NULLS FIRST nested comparison order.
         let cmp = make_comparator(
@@ -527,7 +529,7 @@ mod tests {
         joins::PiecewiseMergeJoinExec,
         test::{TestMemoryExec, assert_join_metrics, build_table_i32},
     };
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{Field, Schema};
     use datafusion_common::test_util::batches_to_string;
     use datafusion_execution::TaskContext;
     use datafusion_execution::config::SessionConfig;
@@ -831,6 +833,48 @@ mod tests {
             .expect("input_batches metric")
             .as_usize();
         assert_eq!(consumed, 1, "partition 1 should not have read any batch");
+        Ok(())
+    }
+
+    #[test]
+    fn test_extreme_key_run_end_encoded() -> Result<()> {
+        use arrow::array::{AsArray, Int32Array, RunArray};
+        use arrow::datatypes::Int32Type;
+
+        let run_ends = Int32Array::from(vec![2, 5, 7]);
+        let values = Int32Array::from(vec![Some(10), None, Some(5)]);
+        let ree = RunArray::<Int32Type>::try_new(&run_ends, &values)?;
+        let array_ref: ArrayRef = Arc::new(ree);
+
+        // min (descending = false): non-null min is 5
+        let min_extreme = extreme_key(&array_ref, false)?;
+        assert_eq!(min_extreme.len(), 1);
+        let min_ree = min_extreme
+            .as_any()
+            .downcast_ref::<RunArray<Int32Type>>()
+            .expect("downcast to RunArray");
+        let min_vals = min_ree.values().as_primitive::<Int32Type>();
+        assert_eq!(min_vals.value(0), 5);
+
+        // max (descending = true): non-null max is 10
+        let max_extreme = extreme_key(&array_ref, true)?;
+        assert_eq!(max_extreme.len(), 1);
+        let max_ree = max_extreme
+            .as_any()
+            .downcast_ref::<RunArray<Int32Type>>()
+            .expect("downcast to RunArray");
+        let max_vals = max_ree.values().as_primitive::<Int32Type>();
+        assert_eq!(max_vals.value(0), 10);
+
+        // all nulls
+        let null_run_ends = Int32Array::from(vec![3]);
+        let null_values = Int32Array::from(vec![None as Option<i32>]);
+        let null_ree = RunArray::<Int32Type>::try_new(&null_run_ends, &null_values)?;
+        let null_array_ref: ArrayRef = Arc::new(null_ree);
+        let null_extreme = extreme_key(&null_array_ref, false)?;
+        assert_eq!(null_extreme.len(), 1);
+        assert!(null_extreme.is_null(0));
+
         Ok(())
     }
 }
