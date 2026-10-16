@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{str::FromStr, sync::Arc};
+use std::sync::Arc;
 
-use arrow::compute::DatePart;
 use arrow::datatypes::{DataType, Field, FieldRef, TimeUnit};
 use datafusion_common::types::{NativeType, logical_date, logical_string};
 use datafusion_common::utils::take_function_args;
@@ -94,8 +93,20 @@ impl ScalarUDFImpl for SparkTrunc {
         info: &SimplifyContext,
     ) -> Result<ExprSimplifyResult> {
         let [dt_expr, fmt_expr] = take_function_args(self.name(), args)?;
+        let return_type = dt_expr.get_type(info.schema())?;
 
         let fmt = match fmt_expr.as_literal() {
+            Some(
+                ScalarValue::Utf8(None)
+                | ScalarValue::Utf8View(None)
+                | ScalarValue::LargeUtf8(None)
+                | ScalarValue::Null,
+            ) => {
+                return Ok(ExprSimplifyResult::Simplified(Expr::Literal(
+                    ScalarValue::try_from(&return_type)?,
+                    None,
+                )));
+            }
             Some(ScalarValue::Utf8(Some(v)))
             | Some(ScalarValue::Utf8View(Some(v)))
             | Some(ScalarValue::LargeUtf8(Some(v))) => v.to_lowercase(),
@@ -106,29 +117,24 @@ impl ScalarUDFImpl for SparkTrunc {
             }
         };
 
-        // Map Spark-specific fmt aliases to datafusion ones
-        let fmt = match fmt.as_str() {
-            "yy" | "yyyy" => "year",
-            "mm" | "mon" => "month",
-            other => other,
+        // Map Spark-specific fmt aliases to datafusion ones.
+        // In Spark TruncDate, supported formats are:
+        // YEAR, YYYY, YY, QUARTER, MONTH, MM, MON, WEEK.
+        // Other formats (including DAY, MONTHS, test, etc.) return NULL.
+        let canon_fmt = match fmt.as_str() {
+            "year" | "yyyy" | "yy" => "year",
+            "quarter" => "quarter",
+            "month" | "mm" | "mon" => "month",
+            "week" => "week",
+            _ => {
+                return Ok(ExprSimplifyResult::Simplified(Expr::Literal(
+                    ScalarValue::try_from(&return_type)?,
+                    None,
+                )));
+            }
         };
 
-        // Accept shared DatePart aliases for the date parts supported by TRUNC.
-        if !matches!(
-            DatePart::from_str(fmt),
-            Ok(DatePart::Year
-                | DatePart::Month
-                | DatePart::Day
-                | DatePart::Week
-                | DatePart::Quarter)
-        ) {
-            return plan_err!(
-                "The format argument of `TRUNC` must represent a year, month, day, week, or quarter."
-            );
-        }
-        let return_type = dt_expr.get_type(info.schema())?;
-
-        let fmt_expr = Expr::Literal(ScalarValue::new_utf8(fmt), None);
+        let fmt_expr = Expr::Literal(ScalarValue::new_utf8(canon_fmt), None);
 
         // Spark uses Dates so we need to cast to timestamp and back to work with datafusion's date_trunc
         Ok(ExprSimplifyResult::Simplified(

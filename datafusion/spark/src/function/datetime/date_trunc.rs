@@ -95,8 +95,20 @@ impl ScalarUDFImpl for SparkDateTrunc {
         info: &SimplifyContext,
     ) -> Result<ExprSimplifyResult> {
         let [fmt_expr, ts_expr] = take_function_args(self.name(), args)?;
+        let ts_type = ts_expr.get_type(info.schema())?;
 
         let fmt = match fmt_expr.as_literal() {
+            Some(
+                ScalarValue::Utf8(None)
+                | ScalarValue::Utf8View(None)
+                | ScalarValue::LargeUtf8(None)
+                | ScalarValue::Null,
+            ) => {
+                return Ok(ExprSimplifyResult::Simplified(Expr::Literal(
+                    ScalarValue::try_from(&ts_type)?,
+                    None,
+                )));
+            }
             Some(ScalarValue::Utf8(Some(v)))
             | Some(ScalarValue::Utf8View(Some(v)))
             | Some(ScalarValue::LargeUtf8(Some(v))) => v.to_lowercase(),
@@ -107,16 +119,30 @@ impl ScalarUDFImpl for SparkDateTrunc {
             }
         };
 
-        // Map Spark-specific fmt aliases to datafusion ones
-        let fmt = match fmt.as_str() {
-            "yy" | "yyyy" => "year",
-            "mm" | "mon" => "month",
-            "dd" => "day",
-            other => other,
+        // In Spark TruncTimestamp, supported formats are:
+        // YEAR, YYYY, YY, QUARTER, MONTH, MM, MON, WEEK, DAY, DD,
+        // HOUR, MINUTE, SECOND, MILLISECOND, MICROSECOND.
+        // Other formats (including MONTHS, DAYS, test, etc.) return NULL.
+        let canon_fmt = match fmt.as_str() {
+            "year" | "yyyy" | "yy" => "year",
+            "quarter" => "quarter",
+            "month" | "mm" | "mon" => "month",
+            "week" => "week",
+            "day" | "dd" => "day",
+            "hour" => "hour",
+            "minute" => "minute",
+            "second" => "second",
+            "millisecond" => "millisecond",
+            "microsecond" => "microsecond",
+            _ => {
+                return Ok(ExprSimplifyResult::Simplified(Expr::Literal(
+                    ScalarValue::try_from(&ts_type)?,
+                    None,
+                )));
+            }
         };
 
         let session_tz = info.config_options().execution.time_zone.clone();
-        let ts_type = ts_expr.get_type(info.schema())?;
 
         // Spark interprets timestamps in the session timezone before truncating,
         // then returns a timestamp at microsecond precision.
@@ -124,7 +150,7 @@ impl ScalarUDFImpl for SparkDateTrunc {
         //
         // For sub-second truncations (second, millisecond, microsecond), timezone
         // adjustment is unnecessary since timezone offsets are whole seconds.
-        let ts_expr = match (&ts_type, fmt) {
+        let ts_expr = match (&ts_type, canon_fmt) {
             // Sub-second truncations don't need timezone adjustment
             (_, "second" | "millisecond" | "microsecond") => ts_expr,
 
@@ -155,7 +181,7 @@ impl ScalarUDFImpl for SparkDateTrunc {
             }
         };
 
-        let fmt_expr = Expr::Literal(ScalarValue::new_utf8(fmt), None);
+        let fmt_expr = Expr::Literal(ScalarValue::new_utf8(canon_fmt), None);
 
         Ok(ExprSimplifyResult::Simplified(Expr::ScalarFunction(
             ScalarFunction::new_udf(

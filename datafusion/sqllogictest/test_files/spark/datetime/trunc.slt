@@ -56,7 +56,7 @@ SELECT trunc('2009-02-12'::date, 'MON'::string);
 query D
 SELECT trunc('2009-02-12'::date, 'MONTHS'::string);
 ----
-2009-02-01
+NULL
 
 # WEEK - truncate to Monday of the week
 query D
@@ -89,9 +89,19 @@ SELECT trunc(NULL::date, 'YEAR'::string);
 ----
 NULL
 
-query error DataFusion error: Optimizer rule 'simplify_expressions' failed\ncaused by\nError during planning: Second argument of `TRUNC` must be non-null scalar Utf8
+query D
 SELECT trunc('2009-02-12'::date, NULL::string);
+----
+NULL
 
 # incorrect format
-query error DataFusion error: Optimizer rule 'simplify_expressions' failed\ncaused by\nError during planning: The format argument of `TRUNC` must represent a year, month, day, week, or quarter.
+query D
 SELECT trunc('2009-02-12'::date, 'test'::string);
+----
+NULL
+
+# format DAY is not supported for trunc in Spark (only date_trunc)
+query D
+SELECT trunc('2009-02-12'::date, 'DAY'::string);
+----
+NULL
